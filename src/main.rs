@@ -87,7 +87,7 @@ async fn uwu(request: Request<Body>) -> std::result::Result<Response<Body>, Infa
                 .headers_mut()
                 .append(CONTENT_TYPE, "application/json".parse().unwrap());
             *response.body_mut() = Body::from(
-                format!("{{\"author_name\":\"{embed_text}\",\"author_url\":\"{embed_url}\",\"provider_name\":\"soundcloud-embedder\",\"provider_url\":\"https://velleda.xyz/\",\"title\":\"SoundCloud\",\"type\":\"link\",\"version\":\"1.0\"}}"),
+                format!("{{\"author_name\":\"{embed_text}\",\"author_url\":\"{embed_url}\",\"provider_name\":\"soundcloud-embedder\",\"provider_url\":\"https://github.com/notvelleda/soundcloud-embedder\",\"title\":\"SoundCloud\",\"type\":\"link\",\"version\":\"1.0\"}}"),
             );
         }
         (&Method::GET, path) => {
