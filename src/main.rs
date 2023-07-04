@@ -4,7 +4,7 @@ pub mod api;
 
 use anyhow::*;
 use hyper::{
-    header::{CONTENT_TYPE, LOCATION, HOST},
+    header::{CONTENT_TYPE, HOST, LOCATION},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server, StatusCode,
 };
@@ -30,9 +30,51 @@ pub const CACHE_TTL_SECS: usize = 28800; // 8 hours
 /// the oembed provider url and the url to redirect the root page to
 pub const WEBSITE_URL: &str = "https://github.com/notvelleda/soundcloud-embedder";
 
+/// handle requests to the oembed endpoint
+fn handle_oembed(request: Request<Body>) -> Result<Response<Body>> {
+    let mut embed_text = "".to_string();
+    let mut embed_url = "".to_string();
+
+    for pair in request.uri().query().iter().flat_map(|q| q.split('&')) {
+        let mut split = pair.split('=');
+
+        match split.next() {
+            Some("text") => embed_text = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
+            Some("url") => embed_url = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
+            _ => (),
+        }
+    }
+
+    #[derive(Serialize)]
+    struct OEmbed<'a> {
+        version: &'a str,
+        r#type: &'a str,
+        title: &'a str,
+        author_name: &'a str,
+        author_url: &'a str,
+        provider_name: &'a str,
+        provider_url: &'a str,
+    }
+
+    let value = OEmbed {
+        version: "1.0",
+        r#type: "link",
+        title: "SoundCloud",
+        author_name: &embed_text,
+        author_url: &embed_url,
+        provider_name: "soundcloud-embedder",
+        provider_url: WEBSITE_URL,
+    };
+
+    let mut response = Response::new(Body::from(serde_json::to_string(&value)?));
+    response.headers_mut().append(CONTENT_TYPE, "application/json".parse()?);
+    Result::Ok(response)
+}
+
+/// makes an html document containing embed information based on the given track info
 fn make_embed_page(hostname: &str, info: api::ResolveInfo) -> String {
     let permalink = html_escape::encode_quoted_attribute(info.permalink_url());
-    let artwork_url = info.artwork_url().replace("-large.jpg", "-t500x500.jpg");
+    let artwork_url = info.artwork_url().replace("-large.jpg", "-t500x500.jpg"); // large isn't large enough
     let artwork_url = html_escape::encode_quoted_attribute(&artwork_url);
     let artist = html_escape::encode_quoted_attribute(info.artist_name());
     let title = html_escape::encode_quoted_attribute(info.title());
@@ -80,97 +122,60 @@ lazy_static! {
     static ref VALID_URL: Regex = Regex::new("^/[^/]+/(?:sets/)?[^/]+(?:/(?:s-[^/]+)?)?$").unwrap();
 }
 
-async fn handle_request(request: Request<Body>, mut conn: ConnectionManager) -> Result<Response<Body>> {
-    let mut response = Response::new(Body::empty());
+/// handle requests to embed a soundcloud page
+async fn handle_page(request: Request<Body>, mut conn: ConnectionManager) -> Result<Response<Body>> {
+    let path = request.uri().path();
+    let absolute_uri = format!("https://soundcloud.com{path}");
 
+    if !VALID_URL.is_match(path) {
+        // this url probably isn't valid, just redirect to soundcloud so there are no api requests for invalid data
+        let mut response = Response::new(Body::from("invalid url, silly!"));
+        *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
+        response.headers_mut().append(LOCATION, absolute_uri.parse()?);
+        Result::Ok(response)
+    } else {
+        let resolved = match conn.get::<&str, Option<String>>(path).await?.and_then(|s| serde_json::from_str(&s).ok()) {
+            Some(resolved) => {
+                debug!("cache hit for {path}");
+                resolved
+            }
+            None => {
+                // data isn't in cache, do an api request to get the info we need
+                debug!("cache miss for {path}");
+
+                let client_id = conn.get::<&str, String>("client_id").await.context("failed to get client id from database")?;
+                let resolved = api::resolve(&client_id, &absolute_uri).await?;
+
+                conn.set_ex::<&str, String, String>(path, serde_json::to_string(&resolved)?, CACHE_TTL_SECS).await?;
+
+                resolved
+            }
+        };
+
+        let hostname = request.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("unknown-host");
+        let mut response = Response::new(Body::from(make_embed_page(hostname, resolved)));
+        response.headers_mut().append(CONTENT_TYPE, "text/html".parse()?);
+        Result::Ok(response)
+    }
+}
+
+/// checks what kind of request was received and handles it accordingly
+async fn handle_request(request: Request<Body>, conn: ConnectionManager) -> Result<Response<Body>> {
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/") => {
+            let mut response = Response::new(Body::from(":3c"));
             *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
             response.headers_mut().append(LOCATION, WEBSITE_URL.parse()?);
-            *response.body_mut() = Body::from(":3c");
+            Ok(response)
         }
-        (&Method::GET, "/favicon.ico") => {
-            *response.status_mut() = StatusCode::NOT_FOUND;
-            *response.body_mut() = Body::from("404, silly!");
-        }
-        (&Method::GET, "/oembed") => {
-            // oembed endpoint
-            let mut embed_text = "".to_string();
-            let mut embed_url = "".to_string();
-
-            for pair in request.uri().query().iter().flat_map(|q| q.split('&')) {
-                let mut split = pair.split('=');
-
-                match split.next() {
-                    Some("text") => embed_text = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
-                    Some("url") => embed_url = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
-                    _ => (),
-                }
-            }
-
-            #[derive(Serialize)]
-            struct OEmbed<'a> {
-                version: &'a str,
-                r#type: &'a str,
-                title: &'a str,
-                author_name: &'a str,
-                author_url: &'a str,
-                provider_name: &'a str,
-                provider_url: &'a str,
-            }
-
-            let value = OEmbed {
-                version: "1.0",
-                r#type: "link",
-                title: "SoundCloud",
-                author_name: &embed_text,
-                author_url: &embed_url,
-                provider_name: "soundcloud-embedder",
-                provider_url: WEBSITE_URL,
-            };
-
-            response.headers_mut().append(CONTENT_TYPE, "application/json".parse()?);
-            *response.body_mut() = Body::from(serde_json::to_string(&value)?);
-        }
-        (&Method::GET, path) => {
-            let absolute_uri = format!("https://soundcloud.com{path}");
-
-            if !VALID_URL.is_match(path) {
-                // this url probably isn't valid, just redirect to soundcloud so there are no requests for invalid data
-                *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
-                response.headers_mut().append(LOCATION, absolute_uri.parse()?);
-                *response.body_mut() = Body::from("invalid url, silly!");
-            } else {
-                let resolved = match conn.get::<&str, Option<String>>(path).await? {
-                    Some(json) => {
-                        debug!("cache hit for {path}");
-                        serde_json::from_str(&json)?
-                    }
-                    None => {
-                        // data isn't in cache, do an api request to get the info we need
-                        debug!("cache miss for {path}");
-
-                        let client_id = conn.get::<&str, String>("client_id").await.context("failed to get client id from database")?;
-                        let resolved = api::resolve(&client_id, &absolute_uri).await?;
-
-                        conn.set_ex::<&str, String, String>(path, serde_json::to_string(&resolved)?, CACHE_TTL_SECS).await?;
-
-                        resolved
-                    }
-                };
-
-                response.headers_mut().append(CONTENT_TYPE, "text/html".parse()?);
-                let hostname = request.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("unknown-host");
-                *response.body_mut() = Body::from(make_embed_page(hostname, resolved));
-            }
-        }
+        (&Method::GET, "/oembed") => handle_oembed(request),
+        (&Method::GET, _) => handle_page(request, conn).await,
         _ => {
+            let mut response = Response::new(Body::from("404, silly!"));
             *response.status_mut() = StatusCode::NOT_FOUND;
-            *response.body_mut() = Body::from("404, silly!");
+            Ok(response)
         }
     }
-
-    Ok(response)
 }
 
 /// wrapper over handle_request() to properly handle errors

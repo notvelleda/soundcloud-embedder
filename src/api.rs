@@ -17,7 +17,8 @@ async fn api_request(url: &str) -> Result<Value> {
     let client = Client::new();
 
     // TODO: replace fake user agent with something like https://github.com/FixTweet/FixTweet/blob/main/src/helpers/useragent.ts
-    let text = client.get(url)
+    let text = client
+        .get(url)
         .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
         .header(ACCEPT_ENCODING, "gzip, deflate, br")
         .header(ACCEPT_LANGUAGE, "en-US,en;q=0.5")
