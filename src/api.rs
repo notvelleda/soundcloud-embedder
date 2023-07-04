@@ -1,19 +1,10 @@
-use super::{MAX_ARTIST_LEN, MAX_TITLE_LEN, MAX_DESCRIPTION_LEN};
+use super::{MAX_ARTIST_LEN, MAX_DESCRIPTION_LEN, MAX_TITLE_LEN};
 use anyhow::*;
-use hyper::header::{
-    ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, AUTHORIZATION, CONNECTION, DNT,
-    ORIGIN, REFERER, USER_AGENT,
-};
+use hyper::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, DNT, ORIGIN, REFERER, USER_AGENT};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_truncate::UnicodeTruncateStr;
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ClientToken {
-    pub client_id: String,
-    pub auth: String,
-}
 
 fn make_resolve_url(client_id: &str, url: &str) -> String {
     let client_id = urlencoding::encode(client_id);
@@ -22,7 +13,7 @@ fn make_resolve_url(client_id: &str, url: &str) -> String {
 }
 
 /// makes a request to the soundcloud api and parses the result as json
-async fn api_request(url: &str, auth: &str) -> Result<Value> {
+async fn api_request(url: &str) -> Result<Value> {
     let client = Client::new();
 
     // TODO: replace fake user agent with something like https://github.com/FixTweet/FixTweet/blob/main/src/helpers/useragent.ts
@@ -30,7 +21,6 @@ async fn api_request(url: &str, auth: &str) -> Result<Value> {
         .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
         .header(ACCEPT_ENCODING, "gzip, deflate, br")
         .header(ACCEPT_LANGUAGE, "en-US,en;q=0.5")
-        .header(AUTHORIZATION, auth)
         .header(CONNECTION, "keep-alive")
         .header(DNT, 1)
         .header(ORIGIN, "https://soundcloud.com")
@@ -53,7 +43,7 @@ async fn api_request(url: &str, auth: &str) -> Result<Value> {
 }
 
 /// stores the info of a track that we care about
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct TrackInfo {
     pub artwork_url: String,
     pub permalink_url: String,
@@ -67,7 +57,7 @@ pub struct TrackInfo {
 }
 
 /// stores the info of a playlist that we care about
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct PlaylistInfo {
     pub artwork_url: String,
     pub permalink_url: String,
@@ -79,7 +69,7 @@ pub struct PlaylistInfo {
     pub reposts_count: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ResolveInfo {
     Track(TrackInfo),
     Playlist(PlaylistInfo),
@@ -123,14 +113,8 @@ impl ResolveInfo {
 
     pub fn counts(&self) -> String {
         match self {
-            Self::Track(info) => format!(
-                "{} ▶    {} ❤️    {} 🔁    {} 💬",
-                info.playback_count, info.likes_count, info.reposts_count, info.comment_count
-            ),
-            Self::Playlist(info) => format!(
-                "{} 🎵    {} ❤️    {} 🔁",
-                info.track_count, info.likes_count, info.reposts_count
-            ),
+            Self::Track(info) => format!("{} ▶    {} ❤️    {} 🔁    {} 💬", info.playback_count, info.likes_count, info.reposts_count, info.comment_count),
+            Self::Playlist(info) => format!("{} 🎵    {} ❤️    {} 🔁", info.track_count, info.likes_count, info.reposts_count),
         }
     }
 }
@@ -152,9 +136,9 @@ fn truncate_string(string: &str, length: usize) -> String {
 }
 
 /// resolve a soundcloud url and parse its information
-pub async fn resolve(token: &ClientToken, url: &str) -> Result<ResolveInfo> {
+pub async fn resolve(client_id: &str, url: &str) -> Result<ResolveInfo> {
     // make api request and parse to json
-    let body = match api_request(&make_resolve_url(&token.client_id, url), &token.auth).await? {
+    let body = match api_request(&make_resolve_url(client_id, url)).await? {
         Value::Object(map) => map,
         _ => return Err(anyhow!("invalid response type")),
     };
@@ -171,6 +155,8 @@ pub async fn resolve(token: &ClientToken, url: &str) -> Result<ResolveInfo> {
             let mut info = TrackInfo::default();
 
             if let Some(Value::String(value)) = body.get("artwork_url") {
+                info.artwork_url = value.to_string();
+            } else if let Some(Value::Object(user)) = body.get("user") && let Some(Value::String(value)) = user.get("avatar_url") {
                 info.artwork_url = value.to_string();
             }
 
@@ -212,6 +198,8 @@ pub async fn resolve(token: &ClientToken, url: &str) -> Result<ResolveInfo> {
             let mut info = PlaylistInfo::default();
 
             if let Some(Value::String(value)) = body.get("artwork_url") {
+                info.artwork_url = value.to_string();
+            } else if let Some(Value::Object(user)) = body.get("user") && let Some(Value::String(value)) = user.get("avatar_url") {
                 info.artwork_url = value.to_string();
             }
 

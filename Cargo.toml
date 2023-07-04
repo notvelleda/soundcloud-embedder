@@ -9,9 +9,9 @@ edition = "2021"
 anyhow = "1"
 env_logger = "0.10"
 log = "0.4"
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "0.14", features = ["full", "deprecated"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = "0.11"
+reqwest = { version = "0.11", features = ["gzip", "deflate", "brotli"] }
 serde_json = "1"
 urlencoding = "2"
 html-escape = "0.2"
@@ -20,3 +20,5 @@ regex = "1"
 url = "2"
 toml = "0.7"
 serde = { version = "1", features = ["derive"] }
+redis = { version = "0.23", features = ["tokio-comp", "connection-manager"]}
+lazy_static = "1"

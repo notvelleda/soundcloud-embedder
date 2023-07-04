@@ -2,19 +2,35 @@
 
 pub mod api;
 
+use anyhow::*;
 use hyper::{
-    header::CONTENT_TYPE,
+    header::{CONTENT_TYPE, LOCATION, HOST},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server, StatusCode,
 };
-use log::error;
-use std::{convert::Infallible, net::ToSocketAddrs};
+use lazy_static::lazy_static;
+use log::{debug, error, info};
+use redis::{aio::ConnectionManager, AsyncCommands};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::{convert::Infallible, net::ToSocketAddrs, path::Path};
 
+/// maximum length for artist names
 pub const MAX_ARTIST_LEN: usize = 64;
+
+/// maximum length for track titles
 pub const MAX_TITLE_LEN: usize = 64;
+
+/// maximum length for track description
 pub const MAX_DESCRIPTION_LEN: usize = 192;
 
-fn make_embed_page(info: api::ResolveInfo) -> String {
+/// how long to cache song data for before making another api request, in seconds
+pub const CACHE_TTL_SECS: usize = 28800; // 8 hours
+
+/// the oembed provider url and the url to redirect the root page to
+pub const WEBSITE_URL: &str = "https://github.com/notvelleda/soundcloud-embedder";
+
+fn make_embed_page(hostname: &str, info: api::ResolveInfo) -> String {
     let permalink = html_escape::encode_quoted_attribute(info.permalink_url());
     let artwork_url = info.artwork_url().replace("-large.jpg", "-t500x500.jpg");
     let artwork_url = html_escape::encode_quoted_attribute(&artwork_url);
@@ -27,17 +43,19 @@ fn make_embed_page(info: api::ResolveInfo) -> String {
     };
 
     let embed_url = format!(
-        "https://fxsoundcloud.com/embed?text={}&url={}",
+        "https://{}/oembed?text={}&url={}",
+        hostname,
         urlencoding::encode(&info.counts()),
         urlencoding::encode(info.permalink_url())
     );
 
-    format!("<!DOCTYPE html>
+    format!(
+        "<!DOCTYPE html>
 <html lang=\"en\">
     <head>
         <link rel=\"canonical\" href=\"{permalink}\"/>
         <meta property=\"theme-color\" content=\"undefined\"/>
-        <meta property=\"twitter:card\" content=\"player\"/>
+        <meta property=\"twitter:card\" content=\"summary\"/>
         <meta property=\"twitter:title\" content=\"{artist} - {title}\"/>
         <meta property=\"twitter:image\" content=\"{artwork_url}\"/>
         <meta property=\"twitter:description\" content=\"{description}\"/>
@@ -53,19 +71,29 @@ fn make_embed_page(info: api::ResolveInfo) -> String {
         <link rel=\"alternate\" href=\"{embed_url}\" type=\"application/json+oembed\" title=\"title\">
     </head>
     <body></body>
-</html>")
+</html>
+"
+    )
 }
 
-async fn uwu(request: Request<Body>) -> std::result::Result<Response<Body>, Infallible> {
-    let mut response = Response::new(Body::empty());
+lazy_static! {
+    static ref VALID_URL: Regex = Regex::new("^/[^/]+/(?:sets/)?[^/]+(?:/(?:s-[^/]+)?)?$").unwrap();
+}
 
-    let token: api::ClientToken = toml::from_str(&std::fs::read_to_string("token.toml").unwrap()).unwrap();
+async fn handle_request(request: Request<Body>, mut conn: ConnectionManager) -> Result<Response<Body>> {
+    let mut response = Response::new(Body::empty());
 
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/") => {
+            *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
+            response.headers_mut().append(LOCATION, WEBSITE_URL.parse()?);
             *response.body_mut() = Body::from(":3c");
         }
-        (&Method::GET, "/embed") => {
+        (&Method::GET, "/favicon.ico") => {
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            *response.body_mut() = Body::from("404, silly!");
+        }
+        (&Method::GET, "/oembed") => {
             // oembed endpoint
             let mut embed_text = "".to_string();
             let mut embed_url = "".to_string();
@@ -74,39 +102,66 @@ async fn uwu(request: Request<Body>) -> std::result::Result<Response<Body>, Infa
                 let mut split = pair.split('=');
 
                 match split.next() {
-                    Some("text") => embed_text = urlencoding::decode(split.next().unwrap_or("")).unwrap_or_default().to_string(),
-                    Some("url") => embed_url = urlencoding::decode(split.next().unwrap_or("")).unwrap_or_default().to_string(),
+                    Some("text") => embed_text = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
+                    Some("url") => embed_url = urlencoding::decode(split.next().unwrap_or_default())?.to_string(),
                     _ => (),
                 }
             }
 
-            let embed_text = html_escape::encode_quoted_attribute(&embed_text);
-            let embed_url = html_escape::encode_quoted_attribute(&embed_url);
+            #[derive(Serialize)]
+            struct OEmbed<'a> {
+                version: &'a str,
+                r#type: &'a str,
+                title: &'a str,
+                author_name: &'a str,
+                author_url: &'a str,
+                provider_name: &'a str,
+                provider_url: &'a str,
+            }
 
-            response
-                .headers_mut()
-                .append(CONTENT_TYPE, "application/json".parse().unwrap());
-            *response.body_mut() = Body::from(
-                format!("{{\"author_name\":\"{embed_text}\",\"author_url\":\"{embed_url}\",\"provider_name\":\"soundcloud-embedder\",\"provider_url\":\"https://github.com/notvelleda/soundcloud-embedder\",\"title\":\"SoundCloud\",\"type\":\"link\",\"version\":\"1.0\"}}"),
-            );
+            let value = OEmbed {
+                version: "1.0",
+                r#type: "link",
+                title: "SoundCloud",
+                author_name: &embed_text,
+                author_url: &embed_url,
+                provider_name: "soundcloud-embedder",
+                provider_url: WEBSITE_URL,
+            };
+
+            response.headers_mut().append(CONTENT_TYPE, "application/json".parse()?);
+            *response.body_mut() = Body::from(serde_json::to_string(&value)?);
         }
         (&Method::GET, path) => {
-            // soundcloud url endpoint
             let absolute_uri = format!("https://soundcloud.com{path}");
 
-            //*response.body_mut() = Body::from(format!("{:#?}", api_request(&make_resolve_url(&token.client_id, &new_uri), &token.auth).await));
-            match api::resolve(&token, &absolute_uri).await {
-                anyhow::Result::Ok(info) => {
-                    response
-                        .headers_mut()
-                        .append(CONTENT_TYPE, "text/html".parse().unwrap());
-                    *response.body_mut() = Body::from(make_embed_page(info));
-                }
-                Err(err) => {
-                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    *response.body_mut() = Body::from(format!("error: {err:?}"));
-                    error!("{err:?}");
-                }
+            if !VALID_URL.is_match(path) {
+                // this url probably isn't valid, just redirect to soundcloud so there are no requests for invalid data
+                *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
+                response.headers_mut().append(LOCATION, absolute_uri.parse()?);
+                *response.body_mut() = Body::from("invalid url, silly!");
+            } else {
+                let resolved = match conn.get::<&str, Option<String>>(path).await? {
+                    Some(json) => {
+                        debug!("cache hit for {path}");
+                        serde_json::from_str(&json)?
+                    }
+                    None => {
+                        // data isn't in cache, do an api request to get the info we need
+                        debug!("cache miss for {path}");
+
+                        let client_id = conn.get::<&str, String>("client_id").await.context("failed to get client id from database")?;
+                        let resolved = api::resolve(&client_id, &absolute_uri).await?;
+
+                        conn.set_ex::<&str, String, String>(path, serde_json::to_string(&resolved)?, CACHE_TTL_SECS).await?;
+
+                        resolved
+                    }
+                };
+
+                response.headers_mut().append(CONTENT_TYPE, "text/html".parse()?);
+                let hostname = request.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("unknown-host");
+                *response.body_mut() = Body::from(make_embed_page(hostname, resolved));
             }
         }
         _ => {
@@ -115,19 +170,74 @@ async fn uwu(request: Request<Body>) -> std::result::Result<Response<Body>, Infa
         }
     }
 
-    std::result::Result::Ok(response) // lol, lmao
+    Ok(response)
+}
+
+/// wrapper over handle_request() to properly handle errors
+async fn handle_request_wrapper(request: Request<Body>, conn: ConnectionManager) -> Result<Response<Body>, Infallible> {
+    match handle_request(request, conn).await {
+        Result::Ok(response) => Result::Ok(response),
+        Err(err) => {
+            let mut response = Response::new(Body::empty());
+
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            *response.body_mut() = Body::from(format!("something bad happened! {err:?}\n"));
+            error!("error in handle_request: {err:?}");
+
+            Result::Ok(response)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Config {
+    redis_address: String,
+    listen_address: String,
+    client_id: String,
 }
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    let service =
-        make_service_fn(|_| async { std::result::Result::Ok::<_, Infallible>(service_fn(uwu)) });
+    let config_path = Path::new("config.toml");
 
-    let server =
-        Server::bind(&"127.0.0.1:3621".to_socket_addrs().unwrap().next().unwrap()).serve(service);
+    if !config_path.exists() {
+        error!("config file {config_path:?} doesn't exist");
 
+        match std::fs::write(config_path, toml::to_string_pretty(&Config::default()).unwrap()) {
+            Result::Ok(_) => error!("created a blank config file, please populate it with options"),
+            Err(err) => error!("failed to create a blank config file: {err:?}"),
+        }
+
+        return;
+    }
+
+    // read config from file
+    let config_text = match std::fs::read_to_string(config_path) {
+        Result::Ok(text) => text,
+        Err(err) => {
+            error!("failed to read config: {err:?}");
+            return;
+        }
+    };
+    let config: Config = toml::from_str(&config_text).unwrap();
+
+    let client = redis::Client::open(config.redis_address).unwrap();
+    let mut con_manager = ConnectionManager::new(client).await.unwrap();
+
+    con_manager.set::<&str, String, String>("client_id", config.client_id).await.unwrap();
+
+    // such an awful api pattern istg
+    let service = make_service_fn(move |_| {
+        let conn = con_manager.clone();
+        async move { std::result::Result::Ok::<_, Infallible>(service_fn(move |req| handle_request_wrapper(req, conn.clone()))) }
+    });
+
+    let addr = config.listen_address.to_socket_addrs().unwrap().next().unwrap();
+    let server = Server::bind(&addr).serve(service);
+
+    info!("server listening on {addr:?}");
     if let Err(err) = server.await {
         error!("{err:?}");
     }
