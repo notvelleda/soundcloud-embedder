@@ -6,14 +6,22 @@ use anyhow::*;
 use hyper::{
     header::{CONTENT_TYPE, HOST, LOCATION},
     service::{make_service_fn, service_fn},
-    Body, Method, Request, Response, Server, StatusCode,
+    Body, Method, Request, Response, Server, StatusCode, server::conn::AddrIncoming,
 };
+use hyper_rustls::TlsAcceptor;
 use lazy_static::lazy_static;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use redis::{aio::ConnectionManager, AsyncCommands};
 use regex::Regex;
+use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, net::ToSocketAddrs, path::Path};
+use std::{
+    convert::Infallible,
+    fs::File,
+    io::BufReader,
+    net::ToSocketAddrs,
+    path::{Path, PathBuf},
+};
 
 /// maximum length for artist names
 pub const MAX_ARTIST_LEN: usize = 64;
@@ -132,7 +140,7 @@ async fn handle_page(request: Request<Body>, mut conn: ConnectionManager) -> Res
         let mut response = Response::new(Body::from("invalid url, silly!"));
         *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
         response.headers_mut().append(LOCATION, absolute_uri.parse()?);
-        Result::Ok(response)
+        Ok(response)
     } else {
         let resolved = match conn.get::<&str, Option<String>>(path).await?.and_then(|s| serde_json::from_str(&s).ok()) {
             Some(resolved) => {
@@ -155,7 +163,7 @@ async fn handle_page(request: Request<Body>, mut conn: ConnectionManager) -> Res
         let hostname = request.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("unknown-host");
         let mut response = Response::new(Body::from(make_embed_page(hostname, resolved)));
         response.headers_mut().append(CONTENT_TYPE, "text/html".parse()?);
-        Result::Ok(response)
+        Ok(response)
     }
 }
 
@@ -183,12 +191,10 @@ async fn handle_request_wrapper(request: Request<Body>, conn: ConnectionManager)
     match handle_request(request, conn).await {
         Result::Ok(response) => Result::Ok(response),
         Err(err) => {
-            let mut response = Response::new(Body::empty());
-
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            *response.body_mut() = Body::from(format!("something bad happened! {err:?}\n"));
             error!("error in handle_request: {err:?}");
 
+            let mut response = Response::new(Body::from(format!("something bad happened! {err}\n")));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             Result::Ok(response)
         }
     }
@@ -199,6 +205,36 @@ struct Config {
     redis_address: String,
     listen_address: String,
     client_id: String,
+    certs_path: PathBuf,
+    private_key_path: PathBuf,
+}
+
+// ssl support adapted from https://github.com/rustls/hyper-rustls/blob/main/examples/server.rs
+
+/// loads public certificates from the file at the given path
+fn load_certs(path: &Path) -> Result<Vec<Certificate>> {
+    // Open certificate file.
+    let certfile = File::open(path)?;
+    let mut reader = BufReader::new(certfile);
+
+    // Load and return certificate.
+    let certs = rustls_pemfile::certs(&mut reader)?;
+    Ok(certs.into_iter().map(Certificate).collect())
+}
+
+/// loads a private key from the file at the given path
+fn load_private_key(filename: &Path) -> Result<PrivateKey> {
+    // Open keyfile.
+    let keyfile = File::open(filename)?;
+    let mut reader = BufReader::new(keyfile);
+
+    // Load and return a single private key.
+    let keys = rustls_pemfile::rsa_private_keys(&mut reader)?;
+    if keys.len() != 1 {
+        return Err(anyhow!("expected a single private key"));
+    }
+
+    Ok(rustls::PrivateKey(keys[0].clone()))
 }
 
 #[tokio::main]
@@ -212,7 +248,7 @@ async fn main() {
 
         match std::fs::write(config_path, toml::to_string_pretty(&Config::default()).unwrap()) {
             Result::Ok(_) => error!("created a blank config file, please populate it with options"),
-            Err(err) => error!("failed to create a blank config file: {err:?}"),
+            Err(err) => error!("failed to create a blank config file: {err}"),
         }
 
         return;
@@ -222,28 +258,69 @@ async fn main() {
     let config_text = match std::fs::read_to_string(config_path) {
         Result::Ok(text) => text,
         Err(err) => {
-            error!("failed to read config: {err:?}");
+            error!("failed to read config: {err}");
             return;
         }
     };
-    let config: Config = toml::from_str(&config_text).unwrap();
+    let config: Config = match toml::from_str(&config_text) {
+        Result::Ok(config) => config,
+        Err(err) => {
+            error!("failed to parse config: {err}");
+            return;
+        }
+    };
+
+    // load certs and privkey from disk
+    let certs = match load_certs(&config.certs_path) {
+        Result::Ok(certs) => Some(certs),
+        Err(err) => {
+            error!("failed to load certs: {err}");
+            None
+        }
+    };
+    let privkey = match load_private_key(&config.private_key_path) {
+        Result::Ok(certs) => Some(certs),
+        Err(err) => {
+            error!("failed to load private key: {err}");
+            None
+        }
+    };
 
     let client = redis::Client::open(config.redis_address).unwrap();
     let mut con_manager = ConnectionManager::new(client).await.unwrap();
 
     con_manager.set::<&str, String, String>("client_id", config.client_id).await.unwrap();
 
-    // such an awful api pattern istg
-    let service = make_service_fn(move |_| {
-        let conn = con_manager.clone();
-        async move { std::result::Result::Ok::<_, Infallible>(service_fn(move |req| handle_request_wrapper(req, conn.clone()))) }
-    });
-
     let addr = config.listen_address.to_socket_addrs().unwrap().next().unwrap();
-    let server = Server::bind(&addr).serve(service);
-
     info!("server listening on {addr:?}");
-    if let Err(err) = server.await {
-        error!("{err:?}");
+
+    if let Some(certs) = certs && let Some(privkey) = privkey {
+        let incoming = AddrIncoming::bind(&addr).unwrap();
+        let acceptor = TlsAcceptor::builder()
+            .with_single_cert(certs, privkey).unwrap()
+            .with_all_versions_alpn()
+            .with_incoming(incoming);
+
+        // such an awful api pattern istg
+        let service = make_service_fn(move |_| {
+            let conn = con_manager.clone();
+            async move { std::result::Result::Ok::<_, Infallible>(service_fn(move |req| handle_request_wrapper(req, conn.clone()))) }
+        });
+
+        if let Err(err) = Server::builder(acceptor).serve(service).await {
+            error!("{err}");
+        }
+    } else {
+        warn!("couldn't load certs or privkey, defaulting to insecure http");
+
+        // has to be duplicated because the ignored closure argument can differ
+        let service = make_service_fn(move |_| {
+            let conn = con_manager.clone();
+            async move { std::result::Result::Ok::<_, Infallible>(service_fn(move |req| handle_request_wrapper(req, conn.clone()))) }
+        });
+
+        if let Err(err) = Server::bind(&addr).serve(service).await {
+            error!("{err}");
+        }
     }
 }

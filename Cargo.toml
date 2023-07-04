@@ -20,5 +20,8 @@ regex = "1"
 url = "2"
 toml = "0.7"
 serde = { version = "1", features = ["derive"] }
-redis = { version = "0.23", features = ["tokio-comp", "connection-manager"]}
+redis = { version = "0.23", features = ["tokio-comp", "connection-manager"] }
 lazy_static = "1"
+hyper-rustls = { git = "https://github.com/rustls/hyper-rustls.git", version = "0.24", features = ["acceptor"] }
+rustls = "0.21"
+rustls-pemfile = "1"
