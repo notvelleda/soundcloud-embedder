@@ -1,46 +1,15 @@
+//! handles interactions with soundcloud's api
+
 use super::{MAX_ARTIST_LEN, MAX_DESCRIPTION_LEN, MAX_TITLE_LEN};
 use anyhow::*;
-use hyper::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, DNT, ORIGIN, REFERER, USER_AGENT};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_truncate::UnicodeTruncateStr;
 
-fn make_resolve_url(client_id: &str, url: &str) -> String {
+pub fn make_resolve_url(client_id: &str, url: &str) -> String {
     let client_id = urlencoding::encode(client_id);
     let url = urlencoding::encode(url);
     format!("https://api-v2.soundcloud.com/resolve?client_id={client_id}&url={url}")
-}
-
-/// makes a request to the soundcloud api and parses the result as json
-async fn api_request(url: &str) -> Result<Value> {
-    let client = Client::new();
-
-    // TODO: replace fake user agent with something like https://github.com/FixTweet/FixTweet/blob/main/src/helpers/useragent.ts
-    let text = client
-        .get(url)
-        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
-        .header(ACCEPT_ENCODING, "gzip, deflate, br")
-        .header(ACCEPT_LANGUAGE, "en-US,en;q=0.5")
-        .header(CONNECTION, "keep-alive")
-        .header(DNT, 1)
-        .header(ORIGIN, "https://soundcloud.com")
-        .header(REFERER, "https://soundcloud.com/")
-        .header("Sec-Fetch-Dest", "empty")
-        .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "same-site")
-        .header(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
-        .header("sec-ch-ua", "\"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"114\", \"Google Chrome\";v=\"114\"")
-        .header("sec-ch-ua-mobile", "?0")
-        .header("sec-ch-ua-platform", "\"Linux\"")
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    let json = serde_json::from_str(&text)?;
-
-    Ok(json)
 }
 
 /// stores the info of a track that we care about
@@ -48,6 +17,7 @@ async fn api_request(url: &str) -> Result<Value> {
 pub struct TrackInfo {
     pub artwork_url: String,
     pub permalink_url: String,
+    pub stream_url: String,
     pub artist_name: String,
     pub title: String,
     pub description: String,
@@ -139,7 +109,7 @@ fn truncate_string(string: &str, length: usize) -> String {
 /// resolve a soundcloud url and parse its information
 pub async fn resolve(client_id: &str, url: &str) -> Result<ResolveInfo> {
     // make api request and parse to json
-    let body = match api_request(&make_resolve_url(client_id, url)).await? {
+    let body = match crate::requests::api_request(&make_resolve_url(client_id, url)).await? {
         Value::Object(map) => map,
         _ => return Err(anyhow!("invalid response type")),
     };
@@ -163,6 +133,20 @@ pub async fn resolve(client_id: &str, url: &str) -> Result<ResolveInfo> {
 
             if let Some(Value::String(value)) = body.get("permalink_url") {
                 info.permalink_url = value.to_string();
+            }
+
+            if let Some(Value::Object(media)) = body.get("media") && let Some(Value::Array(transcodings)) = media.get("transcodings") {
+                for value in transcodings.iter() {
+                    if let Some(Value::String(preset)) = value.get("preset")
+                        && preset.starts_with("opus")
+                        && let Some(Value::Object(format)) = value.get("format")
+                        && let Some(Value::String(protocol)) = format.get("protocol")
+                        && protocol == "hls"
+                        && let Some(Value::String(url)) = value.get("url") {
+                        info.stream_url = url.to_string();
+                        break;
+                    }
+                }
             }
 
             if let Some(Value::Object(user)) = body.get("user") && let Some(Value::String(value)) = user.get("username") {

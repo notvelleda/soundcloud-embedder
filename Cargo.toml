@@ -25,3 +25,10 @@ lazy_static = "1"
 hyper-rustls = { git = "https://github.com/rustls/hyper-rustls.git", version = "0.24", features = ["acceptor"] }
 rustls = "0.21"
 rustls-pemfile = "1"
+prometheus = "0.13"
+image = { version = "0.24", default-features = false, features = ["jpeg"] }
+webm = "1"
+vpx-encode = "0.6"
+env-libvpx-sys = { version = "5", features = ["generate"] }
+opus = "0.3"
+ogg = "0.9"
